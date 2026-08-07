@@ -809,6 +809,7 @@ export interface DesktopConnectionConfig {
   // the user opted in on a machine without secure storage.
   remoteTokenPlainText: boolean
   remoteUrl: string
+  clientCertificate: DesktopClientCertificateConfig | null
   // For a 'cloud' connection: the persisted Hermes Cloud org (slug or id) the
   // connected instance was discovered under, so Settings → Gateway can reopen
   // into that org. Empty string for remote/local.
@@ -833,6 +834,7 @@ export interface DesktopConnectionConfigInput {
   // user opt-in from the renderer.
   allowPlainTextToken?: boolean
   remoteUrl?: string
+  clientCertificate?: Partial<DesktopClientCertificateConfig>
   // For a 'cloud' connection: the selected Hermes Cloud org (slug or id) to
   // persist so Settings can reopen into it. Ignored for remote/local modes.
   cloudOrg?: string
@@ -842,6 +844,13 @@ export interface DesktopConnectionConfigInput {
   sshKeyPath?: string
   sshRemoteHermesPath?: string
   sshRemoteProfile?: string
+}
+
+export interface DesktopClientCertificateConfig {
+  fingerprint: string
+  issuer: string
+  serial: string
+  subject: string
 }
 
 export interface DesktopConnectionTestResult {

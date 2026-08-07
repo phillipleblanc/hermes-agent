@@ -14,6 +14,7 @@ import {
 
 function config(overrides: Partial<DesktopConnectionConfig> = {}): DesktopConnectionConfig {
   return {
+    clientCertificate: null,
     envOverride: false,
     mode: 'remote',
     profile: null,
