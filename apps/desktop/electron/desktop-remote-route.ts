@@ -31,6 +31,7 @@ export type DesktopRemoteRoute =
       source: RouteSource
       token?: unknown
       url: string
+      clientCertificate?: { fingerprint?: string; issuer?: string; serial?: string; subject?: string }
     }
   | {
       connectionId?: string
@@ -96,7 +97,8 @@ export function resolveDesktopRemoteRoute({
         org: kind === 'cloud' ? String(profileConfig?.org || '').trim() || undefined : undefined,
         source: 'profile' as const,
         token: override.token,
-        url: override.url
+        url: override.url,
+        clientCertificate: override.clientCertificate
       },
       matchingConnectionId(registry, route, 'unique')
     )
@@ -155,7 +157,8 @@ export function resolveDesktopRemoteRoute({
       org: kind === 'cloud' ? String(config.remote?.org || '').trim() || undefined : undefined,
       source: 'settings' as const,
       token: config.remote?.token,
-      url: String(config.remote?.url || '')
+      url: String(config.remote?.url || ''),
+      clientCertificate: config.remote?.clientCertificate
     },
     matchingConnectionId(registry, route, 'primary')
   )

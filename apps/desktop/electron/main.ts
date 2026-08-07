@@ -18,6 +18,7 @@ import {
   globalShortcut,
   ipcMain,
   Menu,
+  nativeImage,
   nativeTheme,
   Notification,
   powerMonitor,
@@ -87,6 +88,13 @@ import {
   buildBrowserWindowUrl
 } from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
+import {
+  certificateDisplayName,
+  certificateHostMatches,
+  chooseClientCertificate,
+  filtersFromConfig,
+  filtersFromEnv
+} from './client-certificate-selection'
 import { applyConnectionChange, teardownSshState } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
@@ -197,6 +205,7 @@ import {
   writeBufferToFile
 } from './gateway-file-download'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
+import { probeGatewayWebSocketInRenderer } from './gateway-ws-probe-renderer'
 import { registerGitIpc } from './git-ipc'
 import { clearStaleGitLocks } from './gitlock'
 import { readAndConsumeHandoffResult } from './handoff-result'
@@ -5001,6 +5010,12 @@ function multipartBody(upload) {
 }
 
 function fetchJson(url, token, options: any = {}) {
+  const targetSession = options.session || session.defaultSession
+
+  if (options.session || options.useSessionCookies || options.forceElectronTransport || options.clientCertificate) {
+    return fetchJsonViaElectronSession(url, token, options, targetSession)
+  }
+
   // Retry policy lives in api-transport.ts: idempotent verbs retry on any
   // transient transport error; POST/PUT/DELETE only when the request provably
   // never reached the server (see shouldRetryRequest) — never double-submit.
@@ -5110,6 +5125,88 @@ function fetchJson(url, token, options: any = {}) {
   )
 }
 
+function fetchJsonViaElectronSession(url: string, token: string | null, options: any = {}, targetSession = session.defaultSession) {
+  return new Promise((resolve, reject) => {
+    const body = options.body === undefined ? undefined : Buffer.from(JSON.stringify(options.body))
+
+    const request = electronNet.request({
+      method: options.method || 'GET',
+      url,
+      session: targetSession,
+      useSessionCookies: Boolean(options.useSessionCookies),
+      redirect: 'follow'
+    } as any)
+
+    request.setHeader('Content-Type', 'application/json')
+
+    if (token) {
+      request.setHeader('X-Hermes-Session-Token', token)
+    }
+
+    if (options.bearer) {
+      request.setHeader('Authorization', `Bearer ${options.bearer}`)
+    }
+
+    const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+
+    let settled = false
+
+    const timer = setTimeout(() => {
+      settled = true
+      request.abort()
+      reject(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
+    }, timeoutMs)
+
+    request.on('response', response => {
+      const chunks: Buffer[] = []
+
+      response.on('data', chunk => chunks.push(Buffer.from(chunk)))
+      response.on('end', () => {
+        if (settled) {
+          return
+        }
+
+        clearTimeout(timer)
+        const text = Buffer.concat(chunks).toString('utf8')
+
+        if ((response.statusCode || 500) >= 400) {
+          const error = new Error(`${response.statusCode}: ${text || ''}`) as any
+          error.statusCode = response.statusCode
+          reject(error)
+
+          return
+        }
+
+        try {
+          resolve(text ? JSON.parse(text) : null)
+        } catch {
+          reject(new Error(`Invalid JSON from ${url} (status ${response.statusCode})`))
+        }
+      })
+    })
+
+    request.on('error', error => {
+      if (settled) {
+        return
+      }
+
+      clearTimeout(timer)
+      reject(error)
+    })
+
+    if (body) {
+      request.write(body)
+    }
+
+    request.end()
+  })
+}
+
+function fetchPublicJson(url, options: any = {}) {
+  // Credential-free JSON GET/POST for public gateway endpoints.
+  return fetchJsonViaElectronSession(url, null, options, session.defaultSession)
+}
+
 // Token-auth download that streams the response body straight to a
 // user-selected destination (via finalizeGatewayDownload) instead of buffering
 // the whole file in memory. The connect timeout is cleared once headers arrive
@@ -5169,7 +5266,8 @@ function downloadViaTokenToFile(url, token, ctx, options: any = {}) {
   })
 }
 
-function fetchPublicJson(url, options: any = {}) {
+function fetchPublicJsonLegacy(url, options: any = {}) {
+  // Legacy Node transport retained for local-only compatibility.
   // Credential-free JSON GET/POST for public gateway endpoints
   // (``/api/status``, ``/api/auth/providers``). Unlike ``fetchJson`` it sends
   // NO ``X-Hermes-Session-Token`` header — used by the auth-mode probe before
@@ -6986,6 +7084,7 @@ function getOauthSession() {
   }
 
   oauthSession = session.fromPartition(OAUTH_SESSION_PARTITION)
+  installClientCertificateSelector(oauthSession)
 
   return oauthSession
 }
@@ -7348,6 +7447,16 @@ function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
 // session cookie is attached automatically by Electron's net stack. Used for
 // authed REST against a gated gateway, including minting WS tickets.
 function fetchJsonViaOauthSession(url, options: any = {}) {
+  if (options.forceElectronTransport || options.clientCertificate) {
+    const oauth = getOauthSession()
+
+    if (!oauth) {
+      return Promise.reject(new Error('OAuth session partition is unavailable.'))
+    }
+
+    return fetchJsonViaElectronSession(url, null, { ...options, useSessionCookies: true }, oauth)
+  }
+
   return new Promise((resolve, reject) => {
     const sess = getOauthSessionForUrl(url)
 
@@ -8898,6 +9007,12 @@ function sanitizeConnectionProfiles(raw: Record<string, any>) {
       authMode?: string
       token?: object
       headers?: object
+      clientCertificate?: {
+        fingerprint?: string
+        issuer?: string
+        serial?: string
+        subject?: string
+      }
       org?: string
       savedSsh?: object
     } = {
@@ -8928,6 +9043,17 @@ function sanitizeConnectionProfiles(raw: Record<string, any>) {
 
     if (Object.keys(headers).length > 0) {
       cleaned.headers = headers
+    }
+
+    const clientCertificate = entry.clientCertificate
+
+    if (clientCertificate && typeof clientCertificate === 'object') {
+      cleaned.clientCertificate = {
+        fingerprint: String(clientCertificate.fingerprint || '').trim(),
+        issuer: String(clientCertificate.issuer || '').trim(),
+        serial: String(clientCertificate.serial || '').trim(),
+        subject: String(clientCertificate.subject || '').trim()
+      }
     }
 
     // Preserve the Hermes Cloud org tag on cloud-mode entries so Settings can
@@ -9370,6 +9496,15 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
     remoteAuthMode: authMode,
     remoteOauthConnected,
     remoteUrl,
+    clientCertificate:
+      block.clientCertificate && typeof block.clientCertificate === 'object'
+        ? {
+            fingerprint: String(block.clientCertificate.fingerprint || ''),
+            issuer: String(block.clientCertificate.issuer || ''),
+            serial: String(block.clientCertificate.serial || ''),
+            subject: String(block.clientCertificate.subject || '')
+          }
+        : null,
     // The persisted Hermes Cloud org (slug/id) for a cloud connection, or '' for
     // remote/local. Lets Settings → Gateway reopen into the same org.
     cloudOrg: mode === 'cloud' ? String(block.org || '') : '',
@@ -9398,12 +9533,12 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
 // `org` (optional) is the Hermes Cloud org slug/id the instance was discovered
 // under — persisted so Settings can reopen into the same org; omitted from the
 // block when empty so plain remote connections stay unchanged.
-function buildRemoteBlock(remoteUrl, authMode, token, org?: string, headers?: object) {
-  if (authMode !== 'oauth' && !decryptDesktopSecret(token)) {
+function buildRemoteBlock(remoteUrl, authMode, token, org?: string, headers?: object, clientCertificate?: object) {
+  if (authMode !== 'oauth' && !decryptDesktopSecret(token) && !clientCertificate) {
     throw new Error('Remote gateway session token is required.')
   }
 
-  const block: { url: string; authMode: string; token: object; headers?: object; org?: string } = {
+  const block: { url: string; authMode: string; token: object; headers?: object; org?: string; clientCertificate?: object } = {
     url: normalizeRemoteBaseUrl(remoteUrl),
     authMode,
     token
@@ -9419,6 +9554,10 @@ function buildRemoteBlock(remoteUrl, authMode, token, org?: string, headers?: ob
 
   if (orgValue) {
     block.org = orgValue
+  }
+
+  if (clientCertificate && typeof clientCertificate === 'object') {
+    block.clientCertificate = clientCertificate
   }
 
   return block
@@ -9452,6 +9591,7 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
   // inherit the saved org. A plain 'remote' connection never carries an org
   // (switching cloud→remote drops it), so it stays unset unless mode is cloud.
   const cloudOrg = mode === 'cloud' ? String(input.cloudOrg ?? existingBlock.org ?? '').trim() : ''
+  const clientCertificate = input.clientCertificate ?? existingBlock.clientCertificate
   const incomingToken = typeof input.remoteToken === 'string' ? input.remoteToken.trim() : ''
 
   const remoteHeaders =
@@ -9495,7 +9635,7 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
     if (remoteLike) {
       profiles[key] = {
         mode,
-        ...buildRemoteBlock(remoteUrl, authMode, nextToken, cloudOrg, remoteHeaders)
+        ...buildRemoteBlock(remoteUrl, authMode, nextToken, cloudOrg, remoteHeaders, clientCertificate)
       }
     } else {
       const localEntry = localProfileEntry(rawExistingBlock)
@@ -9515,7 +9655,7 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
   }
 
   const nextRemote = remoteLike
-    ? buildRemoteBlock(remoteUrl, authMode, nextToken, cloudOrg, remoteHeaders)
+    ? buildRemoteBlock(remoteUrl, authMode, nextToken, cloudOrg, remoteHeaders, clientCertificate)
     : existingMode === 'ssh'
       ? rawExistingBlock
       : { url: remoteUrl ? normalizeRemoteBaseUrl(remoteUrl) : remoteUrl, authMode, token: nextToken }
@@ -9567,10 +9707,12 @@ async function buildRemoteConnection(
   remoteHost?,
   remoteKind = 'url',
   remoteIdentity?,
-  headers?
+  headers?,
+  clientCertificate = null
 ) {
   const baseUrl = normalizeRemoteBaseUrl(rawUrl)
   const remoteHeaders = decryptRemoteHeaders(headers)
+  rememberClientCertificateHost(baseUrl)
   // For token/oauth remotes the meaningful host is the real backend URL; for
   // SSH remotes the caller passes the entered/resolved host explicitly (the
   // baseUrl is a 127.0.0.1 tunnel and would be useless in the pill).
@@ -9637,16 +9779,17 @@ async function buildRemoteConnection(
       remoteIdentity,
       remoteKind,
       headers: remoteHeaders,
+      clientCertificate,
       // No static token in OAuth mode; REST is cookie-authed via the partition.
       token: null,
       wsUrl
     }
   }
 
-  if (!token) {
+  if (!token && !clientCertificate) {
     throw new Error(
       'Remote Hermes gateway is selected, but no session token is saved. ' +
-        'Open Settings → Gateway and save a token, or switch back to Local.'
+        'Open Settings → Gateway and save a token or configure an mTLS certificate, or switch back to Local.'
     )
   }
 
@@ -9663,6 +9806,7 @@ async function buildRemoteConnection(
     remoteIdentity,
     remoteKind,
     headers: remoteHeaders,
+    clientCertificate,
     token,
     wsUrl
   }
@@ -10478,7 +10622,8 @@ async function resolveRemoteBackend(profile, options: { poolKey?: string; primar
       undefined,
       route.kind === 'cloud' ? 'cloud' : 'url',
       undefined,
-      route.headers
+      route.headers,
+      route.clientCertificate
     )
   }
 
@@ -10564,13 +10709,24 @@ async function requestJsonForProfile(profile: string, path: string, method: stri
     const nativeAt = await ensureNativeAccessToken(conn.baseUrl).catch(() => null)
 
     if (nativeAt) {
-      return fetchJson(url, null, { ...opts, bearer: nativeAt, headers: conn.headers })
+      return fetchJson(url, null, {
+        ...opts,
+        bearer: nativeAt,
+        headers: conn.headers,
+        forceElectronTransport: true,
+        clientCertificate: conn.clientCertificate
+      })
     }
 
-    return fetchJsonViaOauthSession(url, { ...opts, headers: conn.headers })
+    return fetchJsonViaOauthSession(url, { ...opts, headers: conn.headers, clientCertificate: conn.clientCertificate })
   }
 
-  return fetchJson(url, conn.token, { ...opts, headers: conn.headers })
+  return fetchJson(url, conn.token, {
+    ...opts,
+    headers: conn.headers,
+    forceElectronTransport: Boolean(conn.clientCertificate),
+    clientCertificate: conn.clientCertificate
+  })
 }
 
 async function probeRemoteAuthMode(rawUrl) {
@@ -10748,6 +10904,7 @@ async function testDesktopConnectionConfig(input: any = {}) {
     baseUrl = normalizeRemoteBaseUrl(block.url)
     authMode = normAuthMode(block.authMode)
     testHeaders = decryptRemoteHeaders(block.headers)
+    rememberClientCertificateHost(baseUrl)
 
     if (authMode !== 'oauth') {
       token = decryptDesktopSecret(block.token)
@@ -10760,7 +10917,13 @@ async function testDesktopConnectionConfig(input: any = {}) {
     testHeaders = remote.headers || {}
   }
 
-  const status = (await fetchConnectionStatus(baseUrl, authMode, token, testHeaders)) as any
+  const status = (await fetchConnectionStatus(
+    baseUrl,
+    authMode,
+    token,
+    testHeaders,
+    block?.clientCertificate || input.clientCertificate
+  )) as any
 
   // The HTTP status check above proves the backend is reachable, but the chat
   // surface only works once the renderer's live WebSocket to ``/api/ws``
@@ -10773,18 +10936,27 @@ async function testDesktopConnectionConfig(input: any = {}) {
     mintTicket: url => mintGatewayWsTicket(url, testHeaders)
   })
 
-  // Skip the WS leg only when the runtime genuinely lacks a WebSocket (so an
-  // older Electron/Node never fails the test spuriously); Electron's main
-  // process ships a global WebSocket on every supported version.
-  if (wsUrl && typeof globalThis.WebSocket === 'function') {
-    const probe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket, headers: testHeaders })
+  const cert = block?.clientCertificate || input.clientCertificate
 
-    if (!probe.ok) {
-      throw new Error(
-        `Reached the gateway over HTTP, but the live WebSocket (/api/ws) connection failed: ${probe.reason} ` +
-          'The HTTP check can pass while the WebSocket is blocked by a proxy, firewall, or gateway auth/origin guard.'
-      )
-    }
+  // A client-certificate gateway needs the WS leg run in the RENDERER's
+  // session (the only transport that can present the cert — see
+  // gateway-ws-probe-renderer.ts). Without one, keep the main-process probe
+  // unless this runtime genuinely lacks a WebSocket (so an older Electron/Node
+  // never fails the test spuriously); Electron's main process ships a global
+  // WebSocket on every supported version.
+  let wsProbe = null
+
+  if (wsUrl && cert) {
+    wsProbe = await probeGatewayWebSocketInRenderer(mainWindow?.webContents, wsUrl)
+  } else if (wsUrl && typeof globalThis.WebSocket === 'function') {
+    wsProbe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket, headers: testHeaders })
+  }
+
+  if (wsProbe && !wsProbe.ok) {
+    throw new Error(
+      `Reached the gateway over HTTP, but the live WebSocket (/api/ws) connection failed: ${wsProbe.reason} ` +
+        'The HTTP check can pass while the WebSocket is blocked by a proxy, firewall, or gateway auth/origin guard.'
+    )
   }
 
   return {
@@ -10794,7 +10966,7 @@ async function testDesktopConnectionConfig(input: any = {}) {
   }
 }
 
-async function fetchConnectionStatus(baseUrl, authMode, token, headers = {}) {
+async function fetchConnectionStatus(baseUrl, authMode, token, headers = {}, clientCertificate = null) {
   const url = `${baseUrl}/api/status`
 
   if (authMode === 'oauth') {
@@ -10807,13 +10979,24 @@ async function fetchConnectionStatus(baseUrl, authMode, token, headers = {}) {
     const nativeAt = await ensureNativeAccessToken(baseUrl).catch(() => null)
 
     if (nativeAt) {
-      return fetchJson(url, null, { timeoutMs: 8_000, bearer: nativeAt, headers })
+      return fetchJson(url, null, {
+        timeoutMs: 8_000,
+        bearer: nativeAt,
+        headers,
+        forceElectronTransport: true,
+        clientCertificate
+      })
     }
 
-    return fetchJsonViaOauthSession(url, { timeoutMs: 8_000, headers })
+    return fetchJsonViaOauthSession(url, { timeoutMs: 8_000, headers, clientCertificate })
   }
 
-  return fetchJson(url, token, { timeoutMs: 8_000, headers })
+  return fetchJson(url, token, {
+    timeoutMs: 8_000,
+    headers,
+    forceElectronTransport: Boolean(clientCertificate),
+    clientCertificate
+  })
 }
 
 function resetBootProgressForReconnect() {
@@ -14798,27 +14981,39 @@ ipcMain.handle('hermes:connections:test', async (_event, id) => {
     }
   }
 
-  const status = (await fetchConnectionStatus(baseUrl, authMode, token, testHeaders)) as any
+  const status = (await fetchConnectionStatus(
+    baseUrl,
+    authMode,
+    token,
+    testHeaders,
+    entry.clientCertificate
+  )) as any
 
   // The Test button is the cheapest moment to (re)learn this backend's stable
   // identity for the same-backend roster collapse + Settings hint.
   rememberConnectionInstallId(entry.id, status)
 
   // Same HTTP+WS two-leg check as testDesktopConnectionConfig: HTTP alone is
-  // a false positive when the WebSocket leg is blocked.
+  // a false positive when the WebSocket leg is blocked. A client-certificate
+  // gateway needs the WS leg in the renderer's session (the only transport
+  // that can present the cert); see gateway-ws-probe-renderer.ts.
   const wsUrl = await resolveTestWsUrl(baseUrl, authMode, token, {
     mintTicket: url => mintGatewayWsTicket(url, testHeaders)
   })
 
-  if (wsUrl && typeof globalThis.WebSocket === 'function') {
-    const probe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket, headers: testHeaders })
+  let wsProbe = null
 
-    if (!probe.ok) {
-      throw new Error(
-        `Reached the gateway over HTTP, but the live WebSocket (/api/ws) connection failed: ${probe.reason} ` +
-          'The HTTP check can pass while the WebSocket is blocked by a proxy, firewall, or gateway auth/origin guard.'
-      )
-    }
+  if (wsUrl && entry.clientCertificate) {
+    wsProbe = await probeGatewayWebSocketInRenderer(mainWindow?.webContents, wsUrl)
+  } else if (wsUrl && typeof globalThis.WebSocket === 'function') {
+    wsProbe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket, headers: testHeaders })
+  }
+
+  if (wsProbe && !wsProbe.ok) {
+    throw new Error(
+      `Reached the gateway over HTTP, but the live WebSocket (/api/ws) connection failed: ${wsProbe.reason} ` +
+        'The HTTP check can pass while the WebSocket is blocked by a proxy, firewall, or gateway auth/origin guard.'
+    )
   }
 
   return { ok: true, baseUrl, version: status?.version || null }
@@ -16388,10 +16583,18 @@ ipcMain.handle('hermes:saveImageBuffer', async (_event, payload) => {
 })
 
 ipcMain.handle('hermes:saveClipboardImage', async () => {
-  const image = clipboard.readImage()
+  const imageItem = (await clipboard.read()).find(item => item.types.includes('image/png'))
 
-  if (image && !image.isEmpty()) {
-    return writeComposerImage(image.toPNG(), '.png')
+  if (imageItem) {
+    const imageBlob = await imageItem.getType('image/png')
+
+    if (imageBlob instanceof Blob) {
+      const image = nativeImage.createFromBuffer(Buffer.from(await imageBlob.arrayBuffer()))
+
+      if (!image.isEmpty()) {
+        return writeComposerImage(image.toPNG(), '.png')
+      }
+    }
   }
 
   // WSL2/WSLg doesn't bridge clipboard *images* from the Windows host to the
@@ -17294,6 +17497,62 @@ function registerDeepLinkProtocol() {
 const _gotSingleInstanceLock = app.requestSingleInstanceLock()
 const isPrimaryInstance = _gotSingleInstanceLock
 
+const clientCertificateSelectorInstalled = new WeakSet<object>()
+const clientCertificateHosts = new Set<string>()
+
+function rememberClientCertificateHost(rawUrl: string): void {
+  try {
+    const parsed = new URL(rawUrl)
+
+    if (parsed.protocol === 'https:' && parsed.hostname) {
+      clientCertificateHosts.add(parsed.hostname.toLowerCase())
+    }
+  } catch {
+    // URL validation is handled by the connection resolver.
+  }
+}
+
+function configuredClientCertificateHosts(): string[] {
+  return String(process.env.HERMES_DESKTOP_CLIENT_CERT_HOSTS || '')
+    .split(',')
+    .map(host => host.trim().toLowerCase())
+    .filter(Boolean)
+}
+
+function installClientCertificateSelector(targetSession = session.defaultSession): void {
+  if (!targetSession || clientCertificateSelectorInstalled.has(targetSession)) {
+    return
+  }
+
+  clientCertificateSelectorInstalled.add(targetSession)
+  ;(targetSession as any).on('select-client-certificate', (event, _webContents, url, candidates, callback) => {
+    const allowedHosts = [...clientCertificateHosts, ...configuredClientCertificateHosts()]
+
+    // Never let Chromium silently choose the first certificate for a host that
+    // Desktop did not explicitly establish as a remote gateway.
+    if (!certificateHostMatches(url, allowedHosts)) {
+      event.preventDefault()
+      callback()
+
+      return
+    }
+
+    const selected = chooseClientCertificate(candidates, filtersFromConfig(filtersFromEnv()))
+
+    if (!selected) {
+      event.preventDefault()
+      callback()
+      rememberLog(`No unambiguous mTLS client certificate was available for ${url}.`)
+
+      return
+    }
+
+    event.preventDefault()
+    callback(selected as any)
+    rememberLog(`Selected mTLS client certificate for ${url}: ${certificateDisplayName(selected)}`)
+  })
+}
+
 if (!isPrimaryInstance) {
   // Hard-exit, not app.quit(): the before-quit teardown coordinator defers a
   // plain quit (event.preventDefault + async backend shutdown), and in that
@@ -17367,6 +17626,8 @@ app.whenReady().then(() => {
 
   installMediaPermissions()
   installDownloadHandling()
+  installClientCertificateSelector(session.defaultSession)
+  installClientCertificateSelector(getOauthSession())
   registerMediaProtocol()
   installEmbedReferer()
   installRemoteHeaderRules()
