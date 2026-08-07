@@ -49,6 +49,13 @@ import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from '
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
+import {
+  certificateDisplayName,
+  certificateHostMatches,
+  chooseClientCertificate,
+  filtersFromConfig,
+  filtersFromEnv
+} from './client-certificate-selection'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
 import {
   authModeFromStatus,
@@ -4238,6 +4245,12 @@ function multipartBody(upload) {
 }
 
 function fetchJson(url, token, options: any = {}) {
+  const targetSession = options.session || session.defaultSession
+
+  if (options.session || options.useSessionCookies || options.forceElectronTransport || options.clientCertificate) {
+    return fetchJsonViaElectronSession(url, token, options, targetSession)
+  }
+
   return new Promise((resolve, reject) => {
     const { body, contentType } = options.upload
       ? multipartBody(options.upload)
@@ -4331,12 +4344,90 @@ function fetchJson(url, token, options: any = {}) {
   })
 }
 
+function fetchJsonViaElectronSession(url: string, token: string | null, options: any = {}, targetSession = session.defaultSession) {
+  return new Promise((resolve, reject) => {
+    const body = options.body === undefined ? undefined : Buffer.from(JSON.stringify(options.body))
+
+    const request = electronNet.request({
+      method: options.method || 'GET',
+      url,
+      session: targetSession,
+      useSessionCookies: Boolean(options.useSessionCookies),
+      redirect: 'follow'
+    } as any)
+
+    request.setHeader('Content-Type', 'application/json')
+
+    if (token) {
+      request.setHeader('X-Hermes-Session-Token', token)
+    }
+
+    if (options.bearer) {
+      request.setHeader('Authorization', `Bearer ${options.bearer}`)
+    }
+
+    const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+
+    let settled = false
+
+    const timer = setTimeout(() => {
+      settled = true
+      request.abort()
+      reject(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
+    }, timeoutMs)
+
+    request.on('response', response => {
+      const chunks: Buffer[] = []
+
+      response.on('data', chunk => chunks.push(Buffer.from(chunk)))
+      response.on('end', () => {
+        if (settled) {
+          return
+        }
+
+        clearTimeout(timer)
+        const text = Buffer.concat(chunks).toString('utf8')
+
+        if ((response.statusCode || 500) >= 400) {
+          const error = new Error(`${response.statusCode}: ${text || ''}`) as any
+          error.statusCode = response.statusCode
+          reject(error)
+
+          return
+        }
+
+        try {
+          resolve(text ? JSON.parse(text) : null)
+        } catch {
+          reject(new Error(`Invalid JSON from ${url} (status ${response.statusCode})`))
+        }
+      })
+    })
+
+    request.on('error', error => {
+      if (settled) {
+        return
+      }
+
+      clearTimeout(timer)
+      reject(error)
+    })
+
+    if (body) {
+      request.write(body)
+    }
+
+    request.end()
+  })
+}
+
 function fetchPublicJson(url, options: any = {}) {
-  // Credential-free JSON GET/POST for public gateway endpoints
-  // (``/api/status``, ``/api/auth/providers``). Unlike ``fetchJson`` it sends
-  // NO ``X-Hermes-Session-Token`` header — used by the auth-mode probe before
-  // any credentials exist, and any time we must not leak a token to an
-  // endpoint that doesn't need one.
+  // Credential-free JSON GET/POST for public gateway endpoints.
+  return fetchJsonViaElectronSession(url, null, options, session.defaultSession)
+}
+
+function fetchPublicJsonLegacy(url, options: any = {}) {
+  // Legacy Node transport retained for local-only compatibility.
   return new Promise((resolve, reject) => {
     const body = options.body === undefined ? undefined : Buffer.from(JSON.stringify(options.body))
     let parsed
@@ -4823,7 +4914,11 @@ async function copyImageFromUrl(rawUrl) {
     throw new Error('Could not read image')
   }
 
-  clipboard.writeImage(image)
+  clipboard.write([
+    new Electron.ClipboardItem({
+      'image/png': new Blob([new Uint8Array(image.toPNG())])
+    })
+  ])
 }
 
 async function saveImageFromUrl(rawUrl) {
@@ -5846,6 +5941,7 @@ function getOauthSession() {
   }
 
   oauthSession = session.fromPartition(OAUTH_SESSION_PARTITION)
+  installClientCertificateSelector(oauthSession)
 
   return oauthSession
 }
@@ -6157,6 +6253,16 @@ function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
 // session cookie is attached automatically by Electron's net stack. Used for
 // authed REST against a gated gateway, including minting WS tickets.
 function fetchJsonViaOauthSession(url, options: any = {}) {
+  if (options.forceElectronTransport || options.clientCertificate) {
+    const oauth = getOauthSession()
+
+    if (!oauth) {
+      return Promise.reject(new Error('OAuth session partition is unavailable.'))
+    }
+
+    return fetchJsonViaElectronSession(url, null, { ...options, useSessionCookies: true }, oauth)
+  }
+
   return new Promise((resolve, reject) => {
     const sess = getOauthSession()
 
@@ -6834,6 +6940,12 @@ function sanitizeConnectionProfiles(raw: Record<string, any>) {
       url?: string
       authMode?: string
       token?: object
+      clientCertificate?: {
+        fingerprint?: string
+        issuer?: string
+        serial?: string
+        subject?: string
+      }
       org?: string
       savedSsh?: object
     } = {
@@ -6858,6 +6970,17 @@ function sanitizeConnectionProfiles(raw: Record<string, any>) {
 
     if ((entry as any).token && typeof entry.token === 'object') {
       cleaned.token = entry.token
+    }
+
+    const clientCertificate = entry.clientCertificate
+
+    if (clientCertificate && typeof clientCertificate === 'object') {
+      cleaned.clientCertificate = {
+        fingerprint: String(clientCertificate.fingerprint || '').trim(),
+        issuer: String(clientCertificate.issuer || '').trim(),
+        serial: String(clientCertificate.serial || '').trim(),
+        subject: String(clientCertificate.subject || '').trim()
+      }
     }
 
     // Preserve the Hermes Cloud org tag on cloud-mode entries so Settings can
@@ -7005,6 +7128,15 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
     remoteAuthMode: authMode,
     remoteOauthConnected,
     remoteUrl,
+    clientCertificate:
+      block.clientCertificate && typeof block.clientCertificate === 'object'
+        ? {
+            fingerprint: String(block.clientCertificate.fingerprint || ''),
+            issuer: String(block.clientCertificate.issuer || ''),
+            serial: String(block.clientCertificate.serial || ''),
+            subject: String(block.clientCertificate.subject || '')
+          }
+        : null,
     // The persisted Hermes Cloud org (slug/id) for a cloud connection, or '' for
     // remote/local. Lets Settings → Gateway reopen into the same org.
     cloudOrg: mode === 'cloud' ? String(block.org || '') : '',
@@ -7028,12 +7160,12 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
 // `org` (optional) is the Hermes Cloud org slug/id the instance was discovered
 // under — persisted so Settings can reopen into the same org; omitted from the
 // block when empty so plain remote connections stay unchanged.
-function buildRemoteBlock(remoteUrl, authMode, token, org?: string) {
-  if (authMode !== 'oauth' && !decryptDesktopSecret(token)) {
+function buildRemoteBlock(remoteUrl, authMode, token, org?: string, clientCertificate?: object) {
+  if (authMode !== 'oauth' && !decryptDesktopSecret(token) && !clientCertificate) {
     throw new Error('Remote gateway session token is required.')
   }
 
-  const block: { url: string; authMode: string; token: object; org?: string } = {
+  const block: { url: string; authMode: string; token: object; org?: string; clientCertificate?: object } = {
     url: normalizeRemoteBaseUrl(remoteUrl),
     authMode,
     token
@@ -7043,6 +7175,10 @@ function buildRemoteBlock(remoteUrl, authMode, token, org?: string) {
 
   if (orgValue) {
     block.org = orgValue
+  }
+
+  if (clientCertificate && typeof clientCertificate === 'object') {
+    block.clientCertificate = clientCertificate
   }
 
   return block
@@ -7076,6 +7212,7 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
   // inherit the saved org. A plain 'remote' connection never carries an org
   // (switching cloud→remote drops it), so it stays unset unless mode is cloud.
   const cloudOrg = mode === 'cloud' ? String(input.cloudOrg ?? existingBlock.org ?? '').trim() : ''
+  const clientCertificate = input.clientCertificate ?? existingBlock.clientCertificate
   const incomingToken = typeof input.remoteToken === 'string' ? input.remoteToken.trim() : ''
 
   const nextToken = incomingToken
@@ -7107,7 +7244,7 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
     const profiles = { ...(existing.profiles || {}) }
 
     if (remoteLike) {
-      profiles[key] = { mode, ...buildRemoteBlock(remoteUrl, authMode, nextToken, cloudOrg) }
+      profiles[key] = { mode, ...buildRemoteBlock(remoteUrl, authMode, nextToken, cloudOrg, clientCertificate) }
     } else {
       const localEntry = localProfileEntry(rawExistingBlock)
 
@@ -7126,7 +7263,7 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
   }
 
   const nextRemote = remoteLike
-    ? buildRemoteBlock(remoteUrl, authMode, nextToken, cloudOrg)
+    ? buildRemoteBlock(remoteUrl, authMode, nextToken, cloudOrg, clientCertificate)
     : existingMode === 'ssh'
       ? rawExistingBlock
       : { url: remoteUrl ? normalizeRemoteBaseUrl(remoteUrl) : remoteUrl, authMode, token: nextToken }
@@ -7177,9 +7314,11 @@ async function buildRemoteConnection(
   source,
   remoteHost?,
   remoteKind = 'url',
-  remoteIdentity?
+  remoteIdentity?,
+  clientCertificate = null
 ) {
   const baseUrl = normalizeRemoteBaseUrl(rawUrl)
+  rememberClientCertificateHost(baseUrl)
   // For token/oauth remotes the meaningful host is the real backend URL; for
   // SSH remotes the caller passes the entered/resolved host explicitly (the
   // baseUrl is a 127.0.0.1 tunnel and would be useless in the pill).
@@ -7234,16 +7373,17 @@ async function buildRemoteConnection(
       remoteHost: host || undefined,
       remoteIdentity,
       remoteKind,
+      clientCertificate,
       // No static token in OAuth mode; REST is cookie-authed via the partition.
       token: null,
       wsUrl: buildGatewayWsUrlWithTicket(baseUrl, ticket)
     }
   }
 
-  if (!token) {
+  if (!token && !clientCertificate) {
     throw new Error(
       'Remote Hermes gateway is selected, but no session token is saved. ' +
-        'Open Settings → Gateway and save a token, or switch back to Local.'
+        'Open Settings → Gateway and save a token or configure an mTLS certificate, or switch back to Local.'
     )
   }
 
@@ -7255,6 +7395,7 @@ async function buildRemoteConnection(
     remoteHost: host || undefined,
     remoteIdentity,
     remoteKind,
+    clientCertificate,
     token,
     wsUrl: buildGatewayWsUrl(baseUrl, token)
   }
@@ -7566,7 +7707,9 @@ async function resolveRemoteBackend(profile) {
       token,
       'profile',
       undefined,
-      config.profiles?.[connectionScopeKey(profile)]?.mode === 'cloud' ? 'cloud' : 'url'
+      config.profiles?.[connectionScopeKey(profile)]?.mode === 'cloud' ? 'cloud' : 'url',
+      undefined,
+      override.clientCertificate
     )
   }
 
@@ -7612,7 +7755,9 @@ async function resolveRemoteBackend(profile) {
     token,
     'settings',
     undefined,
-    config.mode === 'cloud' ? 'cloud' : 'url'
+    config.mode === 'cloud' ? 'cloud' : 'url',
+    undefined,
+    config.remote?.clientCertificate
   )
 }
 
@@ -7671,13 +7816,13 @@ async function requestJsonForProfile(profile: string, path: string, method: stri
     const nativeAt = await ensureNativeAccessToken(conn.baseUrl).catch(() => null)
 
     if (nativeAt) {
-      return fetchJson(url, null, { ...opts, bearer: nativeAt })
+      return fetchJson(url, null, { ...opts, bearer: nativeAt, forceElectronTransport: true, clientCertificate: conn.clientCertificate })
     }
 
-    return fetchJsonViaOauthSession(url, opts)
+    return fetchJsonViaOauthSession(url, { ...opts, clientCertificate: conn.clientCertificate })
   }
 
-  return fetchJson(url, conn.token, opts)
+  return fetchJson(url, conn.token, { ...opts, forceElectronTransport: Boolean(conn.clientCertificate), clientCertificate: conn.clientCertificate })
 }
 
 async function probeRemoteAuthMode(rawUrl) {
@@ -7852,6 +7997,7 @@ async function testDesktopConnectionConfig(input: any = {}) {
   if (wantRemote && block?.url) {
     baseUrl = normalizeRemoteBaseUrl(block.url)
     authMode = normAuthMode(block.authMode)
+    rememberClientCertificateHost(baseUrl)
 
     if (authMode !== 'oauth') {
       token = decryptDesktopSecret(block.token)
@@ -7863,7 +8009,13 @@ async function testDesktopConnectionConfig(input: any = {}) {
     authMode = normAuthMode(remote.authMode)
   }
 
-  const status = (await fetchJson(`${baseUrl}/api/status`, token, { timeoutMs: 8_000 })) as any
+  const status = (await fetchJson(`${baseUrl}/api/status`, token, {
+    timeoutMs: 8_000,
+    forceElectronTransport: true,
+    clientCertificate: block?.clientCertificate || input.clientCertificate,
+    session: authMode === 'oauth' ? getOauthSession() : session.defaultSession,
+    useSessionCookies: authMode === 'oauth'
+  })) as any
 
   // The HTTP status check above proves the backend is reachable, but the chat
   // surface only works once the renderer's live WebSocket to ``/api/ws``
@@ -10547,10 +10699,18 @@ ipcMain.handle('hermes:saveImageBuffer', async (_event, payload) => {
 })
 
 ipcMain.handle('hermes:saveClipboardImage', async () => {
-  const image = clipboard.readImage()
+  const imageItem = (await clipboard.read()).find(item => item.types.includes('image/png'))
 
-  if (image && !image.isEmpty()) {
-    return writeComposerImage(image.toPNG(), '.png')
+  if (imageItem) {
+    const imageBlob = await imageItem.getType('image/png')
+
+    if (imageBlob instanceof Blob) {
+      const image = nativeImage.createFromBuffer(Buffer.from(await imageBlob.arrayBuffer()))
+
+      if (!image.isEmpty()) {
+        return writeComposerImage(image.toPNG(), '.png')
+      }
+    }
   }
 
   // WSL2/WSLg doesn't bridge clipboard *images* from the Windows host to the
@@ -11794,6 +11954,62 @@ function registerDeepLinkProtocol() {
 // whole new app instead of routing into the running one.
 const _gotSingleInstanceLock = app.requestSingleInstanceLock()
 
+const clientCertificateSelectorInstalled = new WeakSet<object>()
+const clientCertificateHosts = new Set<string>()
+
+function rememberClientCertificateHost(rawUrl: string): void {
+  try {
+    const parsed = new URL(rawUrl)
+
+    if (parsed.protocol === 'https:' && parsed.hostname) {
+      clientCertificateHosts.add(parsed.hostname.toLowerCase())
+    }
+  } catch {
+    // URL validation is handled by the connection resolver.
+  }
+}
+
+function configuredClientCertificateHosts(): string[] {
+  return String(process.env.HERMES_DESKTOP_CLIENT_CERT_HOSTS || '')
+    .split(',')
+    .map(host => host.trim().toLowerCase())
+    .filter(Boolean)
+}
+
+function installClientCertificateSelector(targetSession = session.defaultSession): void {
+  if (!targetSession || clientCertificateSelectorInstalled.has(targetSession)) {
+    return
+  }
+
+  clientCertificateSelectorInstalled.add(targetSession)
+  ;(targetSession as any).on('select-client-certificate', (event, _webContents, url, candidates, callback) => {
+    const allowedHosts = [...clientCertificateHosts, ...configuredClientCertificateHosts()]
+
+    // Never let Chromium silently choose the first certificate for a host that
+    // Desktop did not explicitly establish as a remote gateway.
+    if (!certificateHostMatches(url, allowedHosts)) {
+      event.preventDefault()
+      callback()
+
+      return
+    }
+
+    const selected = chooseClientCertificate(candidates, filtersFromConfig(filtersFromEnv()))
+
+    if (!selected) {
+      event.preventDefault()
+      callback()
+      rememberLog(`No unambiguous mTLS client certificate was available for ${url}.`)
+
+      return
+    }
+
+    event.preventDefault()
+    callback(selected as any)
+    rememberLog(`Selected mTLS client certificate for ${url}: ${certificateDisplayName(selected)}`)
+  })
+}
+
 if (!_gotSingleInstanceLock) {
   app.quit()
 } else {
@@ -11839,6 +12055,8 @@ app.whenReady().then(() => {
   }
 
   installMediaPermissions()
+  installClientCertificateSelector(session.defaultSession)
+  installClientCertificateSelector(getOauthSession())
   registerMediaProtocol()
   installEmbedReferer()
   registerDeepLinkProtocol()
