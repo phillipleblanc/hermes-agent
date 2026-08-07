@@ -370,7 +370,11 @@ function profileRemoteOverride(config, profile) {
     return null
   }
 
-  return { url, authMode: normAuthMode(entry.authMode), token: entry.token }
+  const clientCertificate = entry.clientCertificate
+
+  return clientCertificate && typeof clientCertificate === 'object'
+    ? { url, authMode: normAuthMode(entry.authMode), token: entry.token, clientCertificate }
+    : { url, authMode: normAuthMode(entry.authMode), token: entry.token }
 }
 
 export interface ProfileRouteOptions {

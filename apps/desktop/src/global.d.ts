@@ -528,6 +528,7 @@ export interface DesktopConnectionConfig {
   remoteTokenPreview: string | null
   remoteTokenSet: boolean
   remoteUrl: string
+  clientCertificate: DesktopClientCertificateConfig | null
   // For a 'cloud' connection: the persisted Hermes Cloud org (slug or id) the
   // connected instance was discovered under, so Settings → Gateway can reopen
   // into that org. Empty string for remote/local.
@@ -548,6 +549,7 @@ export interface DesktopConnectionConfigInput {
   remoteAuthMode?: 'oauth' | 'token'
   remoteToken?: string
   remoteUrl?: string
+  clientCertificate?: Partial<DesktopClientCertificateConfig>
   // For a 'cloud' connection: the selected Hermes Cloud org (slug or id) to
   // persist so Settings can reopen into it. Ignored for remote/local modes.
   cloudOrg?: string
@@ -557,6 +559,13 @@ export interface DesktopConnectionConfigInput {
   sshKeyPath?: string
   sshRemoteHermesPath?: string
   sshRemoteProfile?: string
+}
+
+export interface DesktopClientCertificateConfig {
+  fingerprint: string
+  issuer: string
+  serial: string
+  subject: string
 }
 
 export interface DesktopConnectionTestResult {
