@@ -518,7 +518,7 @@ function hostLabelFromBaseUrl(baseUrl) {
  * The config may carry a `profiles` map keyed by name; an entry counts as an
  * override only with a remote-like `mode` (remote or cloud) and a non-empty
  * `url`. Pure: `token` and `headers` are raw stored secrets; main.ts decrypts
- * them. Returns `{ url, authMode, token, headers } | null`.
+ * them. Returns `{ url, authMode, token, headers?, clientCertificate? } | null`.
  */
 function profileRemoteOverride(config, profile) {
   const key = connectionScopeKey(profile)
@@ -535,12 +535,14 @@ function profileRemoteOverride(config, profile) {
   }
 
   const headers = normalizeRemoteHeaders(entry.headers)
+  const clientCertificate = entry.clientCertificate
 
   return {
     url,
     authMode: normAuthMode(entry.authMode),
     token: entry.token,
-    ...(Object.keys(headers).length > 0 ? { headers } : {})
+    ...(Object.keys(headers).length > 0 ? { headers } : {}),
+    ...(clientCertificate && typeof clientCertificate === 'object' ? { clientCertificate } : {})
   }
 }
 

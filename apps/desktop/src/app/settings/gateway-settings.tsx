@@ -5,7 +5,13 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tip } from '@/components/ui/tooltip'
-import type { DesktopAuthProvider, DesktopCloudAgent, DesktopCloudOrg, DesktopConnectionProbeResult } from '@/global'
+import type {
+  DesktopAuthProvider,
+  DesktopClientCertificateConfig,
+  DesktopCloudAgent,
+  DesktopCloudOrg,
+  DesktopConnectionProbeResult
+} from '@/global'
 import { useI18n } from '@/i18n'
 import { ExternalLink } from '@/lib/external-link'
 import {
@@ -51,6 +57,7 @@ interface GatewaySettingsState {
   // disk (opted-in on a machine without secure storage). Drives the warning banner.
   remoteTokenPlainText: boolean
   remoteUrl: string
+  clientCertificate: DesktopClientCertificateConfig | null
   cloudOrg: string
   sshHost: string
   sshUser: string
@@ -72,6 +79,7 @@ const EMPTY_STATE: GatewaySettingsState = {
   secureTokenStorage: true,
   remoteTokenPlainText: false,
   remoteUrl: '',
+  clientCertificate: null,
   cloudOrg: '',
   sshHost: '',
   sshUser: '',
@@ -147,6 +155,10 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
   const [signingIn, setSigningIn] = useState(false)
   const [state, setState] = useState<GatewaySettingsState>(EMPTY_STATE)
   const [remoteToken, setRemoteToken] = useState('')
+  const [certificateFingerprint, setCertificateFingerprint] = useState('')
+  const [certificateIssuer, setCertificateIssuer] = useState('')
+  const [certificateSerial, setCertificateSerial] = useState('')
+  const [certificateSubject, setCertificateSubject] = useState('')
   const [lastTest, setLastTest] = useState<null | string>(null)
   const [sshHostSuggestions, setSshHostSuggestions] = useState<string[]>([])
   const [sshCustomHost, setSshCustomHost] = useState(false)
@@ -200,6 +212,10 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
 
   const acceptSavedConfig = (config: GatewaySettingsState) => {
     setState(config)
+    setCertificateFingerprint(config.clientCertificate?.fingerprint || '')
+    setCertificateIssuer(config.clientCertificate?.issuer || '')
+    setCertificateSerial(config.clientCertificate?.serial || '')
+    setCertificateSubject(config.clientCertificate?.subject || '')
     setConnectedCloudUrl(savedCloudConnectionUrl(config))
   }
 
@@ -462,6 +478,15 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
     remoteAuthMode: authMode,
     remoteToken: authMode === 'token' ? remoteToken.trim() || undefined : undefined,
     remoteUrl: trimmedUrl,
+    clientCertificate:
+      certificateFingerprint.trim() || certificateIssuer.trim() || certificateSerial.trim() || certificateSubject.trim()
+        ? {
+            fingerprint: certificateFingerprint.trim(),
+            issuer: certificateIssuer.trim(),
+            serial: certificateSerial.trim(),
+            subject: certificateSubject.trim()
+          }
+        : undefined,
     sshHost: state.sshHost.trim(),
     sshUser: state.sshUser.trim() || undefined,
     sshPort: state.sshPort,
@@ -584,7 +609,8 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
       const saved = await window.hermesDesktop.saveConnectionConfig({
         mode: state.mode,
         remoteAuthMode: 'oauth',
-        remoteUrl: trimmedUrl
+        remoteUrl: trimmedUrl,
+        clientCertificate: payload().clientCertificate
       })
 
       if (seq !== signingSeq.current) {
@@ -1020,7 +1046,8 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
         mode: 'remote',
         remoteAuthMode: authMode,
         remoteToken: authMode === 'token' ? remoteToken.trim() || undefined : undefined,
-        remoteUrl: trimmedUrl
+        remoteUrl: trimmedUrl,
+        clientCertificate: payload().clientCertificate
       })
 
       if (seq !== sshTestSeq.current) {
@@ -1366,6 +1393,56 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
                   </div>
                 </div>
               ) : null}
+            </>
+          ) : null}
+
+          {state.mode === 'remote' ? (
+            <>
+              <ListRow
+                action={
+                  <Input
+                    className={cn('h-8 font-mono', CONTROL_TEXT)}
+                    onChange={event => setCertificateFingerprint(event.target.value)}
+                    placeholder="Optional SHA-256 fingerprint"
+                    value={certificateFingerprint}
+                  />
+                }
+                description="Select a certificate from the system store; Hermes never stores the private key."
+                title="mTLS certificate fingerprint"
+              />
+              <ListRow
+                action={
+                  <Input
+                    className={cn('h-8', CONTROL_TEXT)}
+                    onChange={event => setCertificateIssuer(event.target.value)}
+                    placeholder="Optional issuer match"
+                    value={certificateIssuer}
+                  />
+                }
+                title="Certificate issuer"
+              />
+              <ListRow
+                action={
+                  <Input
+                    className={cn('h-8', CONTROL_TEXT)}
+                    onChange={event => setCertificateSerial(event.target.value)}
+                    placeholder="Optional serial match"
+                    value={certificateSerial}
+                  />
+                }
+                title="Certificate serial"
+              />
+              <ListRow
+                action={
+                  <Input
+                    className={cn('h-8', CONTROL_TEXT)}
+                    onChange={event => setCertificateSubject(event.target.value)}
+                    placeholder="Optional subject match"
+                    value={certificateSubject}
+                  />
+                }
+                title="Certificate subject"
+              />
             </>
           ) : null}
         </div>

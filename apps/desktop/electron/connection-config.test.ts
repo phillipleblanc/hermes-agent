@@ -195,6 +195,29 @@ test('profileRemoteOverride preserves normalized remote headers', () => {
   })
 })
 
+test('profileRemoteOverride preserves client-certificate selectors', () => {
+  assert.deepEqual(
+    profileRemoteOverride(
+      {
+        profiles: {
+          coder: {
+            mode: 'remote',
+            url: 'https://gateway.example.com',
+            clientCertificate: { fingerprint: 'AA:BB' }
+          }
+        }
+      },
+      'coder'
+    ),
+    {
+      url: 'https://gateway.example.com',
+      authMode: 'token',
+      token: undefined,
+      clientCertificate: { fingerprint: 'AA:BB' }
+    }
+  )
+})
+
 test('profileRemoteOverride treats a cloud entry as a remote override', () => {
   // A 'cloud' per-profile entry resolves to the same remote backend a 'remote'
   // entry would (Q6) — the override must be returned, not dropped.
